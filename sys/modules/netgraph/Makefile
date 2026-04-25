@@ -36,6 +36,7 @@ SUBDIR=	async \
 	pipe \
 	ppp \
 	pppoe \
+	pppoe_lb \
 	pptpgre \
 	pred1 \
 	rfc1490 \

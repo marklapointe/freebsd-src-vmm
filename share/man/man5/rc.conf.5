@@ -2740,10 +2740,6 @@ and ultimately runs
 with a
 .Ar system
 argument of the same name.
-.It Va pppoed_flags
-.Pq Vt str
-Additional flags to pass to
-.Xr pppoed 8 .
 .It Va pppoed_interface
 .Pq Vt str
 The network interface to run
@@ -2753,6 +2749,55 @@ This is mandatory when
 .Va pppoed_enable
 is set to
 .Dq Li YES .
+.It Va pppoed_flags
+.Pq Vt str
+Additional flags to pass to
+.Xr pppoed 8 .
+For multithreaded PPPoE operation, use this variable to enable load balancing
+and configure worker nodes.
+See the
+.Sx Multithreaded PPPoE Configuration
+section for details.
+.It Va pppoed_loadbalancer
+.Pq Vt bool
+If set to
+.Dq Li YES ,
+enable multithreaded PPPoE mode by creating a
+.Xr ng_pppoe_lb 4
+load balancer node and multiple
+.Xr ng_pppoe 4
+worker nodes.
+This allows parallel processing of PPPoE sessions across multiple CPU cores.
+Default is
+.Dq Li NO
+(single-threaded mode).
+.It Va pppoed_workers
+.Pq Vt int
+Number of worker nodes to create when
+.Va pppoed_loadbalancer
+is enabled.
+For optimal performance, set this to the number of CPU cores available.
+Default is 1.
+.It Va pppoed_algorithm
+.Pq Vt int
+Load balancing algorithm to use when
+.Va pppoed_loadbalancer
+is enabled:
+.Bl -tag -width 3n
+.It Cm 0
+Round-robin distribution for discovery packets (default).
+.It Cm 1
+Hash-based distribution using Session ID.
+.It Cm 2
+Least-loaded worker selection (higher overhead).
+.El
+.It Va pppoed_governor_max
+.Pq Vt int
+CPU governor maximum workers limit.
+When set to 0 (default), the governor auto-detects to the number of CPU cores.
+When set to a positive value, this becomes the hard cap for dynamic worker scaling.
+The value is always clamped to not exceed the number of CPU cores
+.Pq Va mp_ncpus .
 .It Va ntpdate_enable
 .Pq Vt bool
 If set to
@@ -5005,6 +5050,75 @@ option's argument in
 because it is used by other programs and scripts, such as
 .Pa /etc/devd/snd.conf .
 .El
+.Sh MULTITHREADED PPPOE CONFIGURATION
+For high-throughput broadband access concentrators, multithreaded PPPoE can be
+enabled to distribute PPPoE sessions across multiple CPU cores.
+This feature uses the
+.Xr ng_pppoe_lb 4
+kernel module to load balance sessions across multiple
+.Xr ng_pppoe 4
+worker nodes.
+.Pp
+To enable multithreaded PPPoE, add the following to
+.Pa /etc/rc.conf :
+.Bd -literal -offset indent
+pppoed_enable="YES"
+pppoed_interface="em0"
+pppoed_loadbalancer="YES"
+pppoed_workers="8"
+pppoed_algorithm="1"
+pppoed_governor_max="0"
+.Ed
+.Pp
+The above configuration:
+.Bl -bullet
+.It
+Enables the PPPoE daemon at boot
+.It
+Specifies
+.Pa em0
+as the network interface
+.It
+Enables multithreaded mode with load balancing
+.It
+Creates 8 worker nodes (typically match CPU core count)
+.It
+Uses hash-based load balancing (algorithm 1)
+.It
+Allows the CPU governor to auto-detect the maximum workers
+.El
+.Pp
+The CPU governor monitors system-wide CPU utilization and can dynamically
+scale workers up or down:
+.Bl -tag -width 3n
+.It Cm Scale-up
+Triggered when CPU utilization exceeds 80%.
+.It Cm Scale-down
+Triggered when CPU utilization drops below 30%.
+.El
+.Pp
+For optimal performance:
+.Bl -bullet
+.It
+Set
+.Va pppoed_workers
+to the number of CPU cores available.
+.It
+Use algorithm 1 (hash-based) for most deployments.
+.It
+Monitor statistics using
+.Xr ngctl 8
+.Ic pppoe_lb
+subcommands.
+.It
+Set
+.Va pppoed_governor_max
+to 0 for auto-detection, or to an explicit value to cap dynamic scaling.
+.El
+.Pp
+Default behavior (without
+.Va pppoed_loadbalancer )
+remains single-threaded and backward compatible with existing deployments.
 .Sh SERVICE JAILS
 The service jails part of the rc system automatically puts a service
 into a jail.

@@ -39,6 +39,7 @@
 #include <netgraph/ng_ether.h>
 #include <netgraph/ng_message.h>
 #include <netgraph/ng_pppoe.h>
+#include <netgraph/ng_pppoe_lb.h>
 #include <netgraph/ng_socket.h>
 
 #include <errno.h>
@@ -73,7 +74,12 @@ static int
 usage(const char *prog)
 {
   fprintf(stderr, "usage: %s [-Fd] [-P pidfile] [-a name] [-e exec | -l label]"
-          " [-n ngdebug] [-p provider] interface\n", prog);
+          " [-n ngdebug] [-p provider] [-L] [-w workers] [-A algorithm]"
+          " [-G max_workers] interface\n", prog);
+  fprintf(stderr, "  -L              Enable load balancer (multithreaded mode)\n");
+  fprintf(stderr, "  -w workers      Number of worker nodes (default: 1)\n");
+  fprintf(stderr, "  -A algorithm    Load balancing algorithm: 0=round-robin, 1=hash, 2=least-loaded\n");
+  fprintf(stderr, "  -G max_workers  Maximum workers for governor (0=unlimited)\n");
   return EX_USAGE;
 }
 
@@ -85,11 +91,11 @@ Farewell(int sig)
 
 static int
 ConfigureNode(const char *prog, const char *iface, const char *provider,
-              int cs, int ds, int debug, struct ngm_connect *ngc)
+              int cs, int ds, int debug, struct ngm_connect *ngc,
+              int use_load_balancer, int num_workers, int algorithm, int max_workers)
 {
   /*
-   * We're going to do this with the passed `ds' & `cs' descriptors:
-   *
+   * Single-threaded mode (use_load_balancer=0):
    * .---------.
    * |  ether  |
    * | <iface> |
@@ -102,26 +108,36 @@ ConfigureNode(const char *prog, const char *iface, const char *provider,
    * |  pppoe  |                                |  socket   |
    * | <iface> |(pppoe-<pid>)<---->(pppoe-<pid>)| <unnamed> |
    * `---------                                 `-----------'
-   * (exec-<pid>)
-   *     ^                .-----------.      .-------------.
-   *     |                |   socket  |      | ppp -direct |
-   *     `--->(exec-<pid>)| <unnamed> |--fd--|  provider   |
-   *                      `-----------'      `-------------'
+   *
+   * Multi-threaded mode (use_load_balancer=1):
+   * .---------.
+   * |  ether  |
+   * | <iface> |
+   * `---------'
+   *     |
+   *     v
+   * .-------------.
+   * |  pppoe_lb   |  (load balancer)
+   * `-------------'
+   *   /    |    \
+   *  v     v     v
+   * w0    w1    w2 ... wN  (worker ng_pppoe nodes)
    *
    * where there are potentially many ppp processes running off of the
    * same PPPoE node.
    * The exec-<pid> hook isn't made 'till we Spawn().
    */
 
-  char *epath, *spath;
+  char *epath, *spath, *lbpath, *workerpath;
   struct ngpppoe_init_data *data;
   const struct hooklist *hlist;
   const struct nodeinfo *ninfo;
   const struct linkinfo *nlink;
   struct ngm_mkpeer mkp;
   struct ng_mesg *resp;
+  struct ng_pppoe_lb_config cfg;
   u_char rbuf[2048];
-  int f, plen;
+  int f, plen, i;
 
   /*
    * Ask for a list of hooks attached to the "ether" node.  This node should
@@ -164,38 +180,17 @@ ConfigureNode(const char *prog, const char *iface, const char *provider,
     return EX_DATAERR;
   }
 
-  /* look for a hook already attached.  */
-  for (f = 0; f < ninfo->hooks; f++) {
-    nlink = &hlist->link[f];
-
-    if (debug)
-      fprintf(stderr, "  Got [%x]:%s -> [%x]:%s\n", ninfo->id,
-              nlink->ourhook, nlink->nodeinfo.id, nlink->peerhook);
-
-    if (!strcmp(nlink->ourhook, NG_ETHER_HOOK_ORPHAN) ||
-        !strcmp(nlink->ourhook, NG_ETHER_HOOK_DIVERT)) {
-      /*
-       * Something is using the data coming out of this `ether' node.
-       * If it's a PPPoE node, we use that node, otherwise we complain that
-       * someone else is using the node.
-       */
-      if (strcmp(nlink->nodeinfo.type, NG_PPPOE_NODE_TYPE)) {
-        fprintf(stderr, "%s Node type %s is currently active\n",
-                epath, nlink->nodeinfo.type);
-        return EX_UNAVAILABLE;
-      }
-      break;
-    }
-  }
-
-  if (f == ninfo->hooks) {
+  if (use_load_balancer && num_workers > 1) {
     /*
-     * Create a new PPPoE node connected to the `ether' node using
-     * the magic `orphan' and `ethernet' hooks
+     * Multi-threaded mode: Create load balancer and workers
      */
-    snprintf(mkp.type, sizeof mkp.type, "%s", NG_PPPOE_NODE_TYPE);
+    if (debug)
+      fprintf(stderr, "Creating load balancer with %d workers\n", num_workers);
+
+    /* Create load balancer node */
+    snprintf(mkp.type, sizeof mkp.type, "%s", "pppoe_lb");
     snprintf(mkp.ourhook, sizeof mkp.ourhook, "%s", NG_ETHER_HOOK_ORPHAN);
-    snprintf(mkp.peerhook, sizeof mkp.peerhook, "%s", NG_PPPOE_HOOK_ETHERNET);
+    snprintf(mkp.peerhook, sizeof mkp.peerhook, "%s", NG_PPPOE_LB_HOOK_ETHER);
 
     if (debug)
       fprintf(stderr, "Send MKPEER: %s%s -> [type %s]:%s\n", epath,
@@ -203,47 +198,171 @@ ConfigureNode(const char *prog, const char *iface, const char *provider,
 
     if (NgSendMsg(cs, epath, NGM_GENERIC_COOKIE,
                   NGM_MKPEER, &mkp, sizeof mkp) < 0) {
-      fprintf(stderr, "%s Cannot create a peer PPPoE node: %s\n",
+      fprintf(stderr, "%s Cannot create a peer PPPoE load balancer node: %s\n",
               epath, strerror(errno));
       return EX_OSERR;
     }
-  }
 
-  /* Connect the PPPoE node to our socket node.  */
-  snprintf(ngc->path, sizeof ngc->path, "%s%s", epath, NG_ETHER_HOOK_ORPHAN);
-  snprintf(ngc->ourhook, sizeof ngc->ourhook, "pppoe-%ld", (long)getpid());
-  memcpy(ngc->peerhook, ngc->ourhook, sizeof ngc->peerhook);
+    /* Create worker nodes */
+    for (i = 0; i < num_workers; i++) {
+      lbpath = (char *)alloca(strlen(iface) + 32);
+      sprintf(lbpath, "%s%s:", epath, NG_ETHER_HOOK_ORPHAN);
 
-  if (NgSendMsg(cs, ".:", NGM_GENERIC_COOKIE,
-                NGM_CONNECT, ngc, sizeof *ngc) < 0) {
-    perror("Cannot CONNECT PPPoE and socket nodes");
-    return EX_OSERR;
-  }
+      snprintf(mkp.type, sizeof mkp.type, "%s", NG_PPPOE_NODE_TYPE);
+      snprintf(mkp.ourhook, sizeof mkp.ourhook, "%s%d", NG_PPPOE_LB_HOOK_WORKER_BASE, i);
+      snprintf(mkp.peerhook, sizeof mkp.peerhook, "%s", NG_PPPOE_HOOK_ETHERNET);
 
-  plen = strlen(provider);
+      if (debug)
+        fprintf(stderr, "Send MKPEER: %s%s -> [type %s]:%s\n", lbpath,
+                mkp.ourhook, mkp.type, mkp.peerhook);
 
-  data = (struct ngpppoe_init_data *)alloca(sizeof *data + plen);
-  snprintf(data->hook, sizeof data->hook, "%s", ngc->peerhook);
-  memcpy(data->data, provider, plen);
-  data->data_len = plen;
+      if (NgSendMsg(cs, lbpath, NGM_GENERIC_COOKIE,
+                    NGM_MKPEER, &mkp, sizeof mkp) < 0) {
+        fprintf(stderr, "%s Cannot create worker %d PPPoE node: %s\n",
+                lbpath, i, strerror(errno));
+        return EX_OSERR;
+      }
+    }
 
-  spath = (char *)alloca(strlen(ngc->peerhook) + 3);
-  strcpy(spath, ".:");
-  strcpy(spath + 2, ngc->ourhook);
+    /* Configure load balancer */
+    lbpath = (char *)alloca(strlen(iface) + 32);
+    sprintf(lbpath, "%s%s:", epath, NG_ETHER_HOOK_ORPHAN);
 
-  if (debug) {
-    if (provider)
-      fprintf(stderr, "Sending PPPOE_LISTEN to %s, provider %s\n",
-              spath, provider);
-    else
-      fprintf(stderr, "Sending PPPOE_LISTEN to %s\n", spath);
-  }
+    cfg.algorithm = algorithm;
+    cfg.max_workers = max_workers;
+    cfg.debug_level = debug ? 1 : 0;
 
-  if (NgSendMsg(cs, spath, NGM_PPPOE_COOKIE, NGM_PPPOE_LISTEN,
-                data, sizeof *data + plen) == -1) {
-    fprintf(stderr, "%s: Cannot LISTEN on netgraph node: %s\n",
-            spath, strerror(errno));
-    return EX_OSERR;
+    if (debug)
+      fprintf(stderr, "Configuring load balancer: algorithm=%d, max_workers=%d\n",
+              algorithm, max_workers);
+
+    if (NgSendMsg(cs, lbpath, NGM_PPPOE_LB_COOKIE,
+                  NGM_PPPOE_LB_SET_CONFIG, &cfg, sizeof cfg) < 0) {
+      fprintf(stderr, "%s Cannot configure load balancer: %s\n",
+              lbpath, strerror(errno));
+      return EX_OSERR;
+    }
+
+    /* Connect socket to load balancer */
+    snprintf(ngc->path, sizeof ngc->path, "%s%s", epath, NG_ETHER_HOOK_ORPHAN);
+    snprintf(ngc->ourhook, sizeof ngc->ourhook, "pppoe-%ld", (long)getpid());
+    memcpy(ngc->peerhook, ngc->ourhook, sizeof ngc->peerhook);
+
+    if (NgSendMsg(cs, ".:", NGM_GENERIC_COOKIE,
+                  NGM_CONNECT, ngc, sizeof *ngc) < 0) {
+      perror("Cannot CONNECT PPPoE load balancer and socket nodes");
+      return EX_OSERR;
+    }
+
+    plen = strlen(provider);
+    data = (struct ngpppoe_init_data *)alloca(sizeof *data + plen);
+    snprintf(data->hook, sizeof data->hook, "%s", ngc->peerhook);
+    memcpy(data->data, provider, plen);
+    data->data_len = plen;
+
+    spath = (char *)alloca(strlen(ngc->peerhook) + 3);
+    strcpy(spath, ".:");
+    strcpy(spath + 2, ngc->ourhook);
+
+    if (debug) {
+      if (provider)
+        fprintf(stderr, "Sending PPPOE_LISTEN to %s (load balancer), provider %s\n",
+                spath, provider);
+      else
+        fprintf(stderr, "Sending PPPOE_LISTEN to %s (load balancer)\n", spath);
+    }
+
+    if (NgSendMsg(cs, spath, NGM_PPPOE_COOKIE, NGM_PPPOE_LISTEN,
+                  data, sizeof *data + plen) == -1) {
+      fprintf(stderr, "%s: Cannot LISTEN on netgraph load balancer node: %s\n",
+              spath, strerror(errno));
+      return EX_OSERR;
+    }
+  } else {
+    /*
+     * Single-threaded mode: Use existing behavior
+     */
+    /* look for a hook already attached.  */
+    for (f = 0; f < ninfo->hooks; f++) {
+      nlink = &hlist->link[f];
+
+      if (debug)
+        fprintf(stderr, "  Got [%x]:%s -> [%x]:%s\n", ninfo->id,
+                nlink->ourhook, nlink->nodeinfo.id, nlink->peerhook);
+
+      if (!strcmp(nlink->ourhook, NG_ETHER_HOOK_ORPHAN) ||
+          !strcmp(nlink->ourhook, NG_ETHER_HOOK_DIVERT)) {
+        /*
+         * Something is using the data coming out of this `ether' node.
+         * If it's a PPPoE node, we use that node, otherwise we complain that
+         * someone else is using the node.
+         */
+        if (strcmp(nlink->nodeinfo.type, NG_PPPOE_NODE_TYPE)) {
+          fprintf(stderr, "%s Node type %s is currently active\n",
+                  epath, nlink->nodeinfo.type);
+          return EX_UNAVAILABLE;
+        }
+        break;
+      }
+    }
+
+    if (f == ninfo->hooks) {
+      /*
+       * Create a new PPPoE node connected to the `ether' node using
+       * the magic `orphan' and `ethernet' hooks
+       */
+      snprintf(mkp.type, sizeof mkp.type, "%s", NG_PPPOE_NODE_TYPE);
+      snprintf(mkp.ourhook, sizeof mkp.ourhook, "%s", NG_ETHER_HOOK_ORPHAN);
+      snprintf(mkp.peerhook, sizeof mkp.peerhook, "%s", NG_PPPOE_HOOK_ETHERNET);
+
+      if (debug)
+        fprintf(stderr, "Send MKPEER: %s%s -> [type %s]:%s\n", epath,
+                mkp.ourhook, mkp.type, mkp.peerhook);
+
+      if (NgSendMsg(cs, epath, NGM_GENERIC_COOKIE,
+                    NGM_MKPEER, &mkp, sizeof mkp) < 0) {
+        fprintf(stderr, "%s Cannot create a peer PPPoE node: %s\n",
+                epath, strerror(errno));
+        return EX_OSERR;
+      }
+    }
+
+    /* Connect the PPPoE node to our socket node.  */
+    snprintf(ngc->path, sizeof ngc->path, "%s%s", epath, NG_ETHER_HOOK_ORPHAN);
+    snprintf(ngc->ourhook, sizeof ngc->ourhook, "pppoe-%ld", (long)getpid());
+    memcpy(ngc->peerhook, ngc->ourhook, sizeof ngc->peerhook);
+
+    if (NgSendMsg(cs, ".:", NGM_GENERIC_COOKIE,
+                  NGM_CONNECT, ngc, sizeof *ngc) < 0) {
+      perror("Cannot CONNECT PPPoE and socket nodes");
+      return EX_OSERR;
+    }
+
+    plen = strlen(provider);
+
+    data = (struct ngpppoe_init_data *)alloca(sizeof *data + plen);
+    snprintf(data->hook, sizeof data->hook, "%s", ngc->peerhook);
+    memcpy(data->data, provider, plen);
+    data->data_len = plen;
+
+    spath = (char *)alloca(strlen(ngc->peerhook) + 3);
+    strcpy(spath, ".:");
+    strcpy(spath + 2, ngc->ourhook);
+
+    if (debug) {
+      if (provider)
+        fprintf(stderr, "Sending PPPOE_LISTEN to %s, provider %s\n",
+                spath, provider);
+      else
+        fprintf(stderr, "Sending PPPOE_LISTEN to %s\n", spath);
+    }
+
+    if (NgSendMsg(cs, spath, NGM_PPPOE_COOKIE, NGM_PPPOE_LISTEN,
+                  data, sizeof *data + plen) == -1) {
+      fprintf(stderr, "%s: Cannot LISTEN on netgraph node: %s\n",
+              spath, strerror(errno));
+      return EX_OSERR;
+    }
   }
 
   return 0;
@@ -457,16 +576,26 @@ Spawn(const char *prog, const char *acname, const char *provider,
 
 #ifndef NOKLDLOAD
 static int
-LoadModules(void)
+LoadModules(int use_load_balancer)
 {
   const char *module[] = { "netgraph", "ng_socket", "ng_ether", "ng_pppoe" };
-  int f;
+  int f, num_modules;
 
-  for (f = 0; f < sizeof module / sizeof *module; f++)
+  num_modules = sizeof module / sizeof *module;
+
+  for (f = 0; f < num_modules; f++)
     if (modfind(module[f]) == -1 && kldload(module[f]) == -1) {
       fprintf(stderr, "kldload: %s: %s\n", module[f], strerror(errno));
       return 0;
     }
+
+  /* Load load balancer module if requested */
+  if (use_load_balancer) {
+    if (modfind("ng_pppoe_lb") == -1 && kldload("ng_pppoe_lb") == -1) {
+      fprintf(stderr, "kldload: ng_pppoe_lb: %s\n", strerror(errno));
+      return 0;
+    }
+  }
 
   return 1;
 }
@@ -504,6 +633,8 @@ main(int argc, char *argv[])
   struct sigaction act;
   int ch, cs, ds, ret, optF, optd, optn, sz, f;
   const char *pidfile;
+  int optL, optw, optA, optG;
+  int num_workers, algorithm, max_workers;
 
   prog = strrchr(argv[0], '/');
   prog = prog ? prog + 1 : argv[0];
@@ -513,8 +644,12 @@ main(int argc, char *argv[])
   acname = NULL;
   provider = "";
   optF = optd = optn = 0;
+  optL = optw = optA = optG = 0;
+  num_workers = 1;
+  algorithm = NG_PPPOE_LB_ALGO_ROUND_ROBIN;
+  max_workers = 0;
 
-  while ((ch = getopt(argc, argv, "FP:a:de:l:n:p:")) != -1) {
+  while ((ch = getopt(argc, argv, "FP:a:de:l:n:p:Lw:A:G:")) != -1) {
     switch (ch) {
       case 'F':
         optF = 1;
@@ -547,6 +682,37 @@ main(int argc, char *argv[])
 
       case 'p':
         provider = optarg;
+        break;
+
+      case 'L':
+        optL = 1;
+        break;
+
+      case 'w':
+        optw = 1;
+        num_workers = atoi(optarg);
+        if (num_workers < 1) {
+          fprintf(stderr, "%s: Invalid number of workers: %s\n", prog, optarg);
+          return usage(prog);
+        }
+        break;
+
+      case 'A':
+        optA = 1;
+        algorithm = atoi(optarg);
+        if (algorithm < 0 || algorithm > 2) {
+          fprintf(stderr, "%s: Invalid algorithm: %s (must be 0, 1, or 2)\n", prog, optarg);
+          return usage(prog);
+        }
+        break;
+
+      case 'G':
+        optG = 1;
+        max_workers = atoi(optarg);
+        if (max_workers < 0) {
+          fprintf(stderr, "%s: Invalid max_workers: %s\n", prog, optarg);
+          return usage(prog);
+        }
         break;
 
       default:
@@ -590,7 +756,7 @@ main(int argc, char *argv[])
   }
 
 #ifndef NOKLDLOAD
-  if (!LoadModules())
+  if (!LoadModules(optL))
     return EX_UNAVAILABLE;
 #endif
 
@@ -602,7 +768,7 @@ main(int argc, char *argv[])
 
   /* Connect it up (and fill in `ngc') */
   if ((ret = ConfigureNode(prog, argv[optind], provider, cs, ds,
-                           optd, &ngc)) != 0) {
+                           optd, &ngc, optL, num_workers, algorithm, max_workers)) != 0) {
     close(cs);
     close(ds);
     return ret;

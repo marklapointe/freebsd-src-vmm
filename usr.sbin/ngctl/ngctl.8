@@ -31,7 +31,7 @@
 .\" OF SUCH DAMAGE.
 .\" $Whistle: ngctl.8,v 1.6 1999/01/20 03:19:44 archie Exp $
 .\"
-.Dd August 29, 2025
+.Dd April 23, 2026
 .Dt NGCTL 8
 .Os
 .Sh NAME
@@ -133,6 +133,25 @@ types      Show information about all installed node types
 write      Send a data packet down the hook named by "hook".
 quit       Exit program
 .Ed
+.Pp
+For
+.Xr ng_pppoe_lb 4
+nodes, the following subcommands are available:
+.Pp
+.Bd -literal -offset indent -compact
+pppoe_lb show <path>     Display load balancer statistics and configuration
+pppoe_lb config <path>   Reconfigure load balancer parameters
+pppoe_lb stats <path>    Show detailed packet and session statistics
+pppoe_lb map <path>      Display session-to-worker mapping table
+.Ed
+.Pp
+The
+.Ic pppoe_lb
+subcommands provide management and monitoring capabilities for the PPPoE
+load balancer.
+See
+.Xr ng_pppoe_lb 4
+for detailed information about control messages and configuration options.
 .Pp
 Some commands have aliases, e.g.,
 .Dq ls

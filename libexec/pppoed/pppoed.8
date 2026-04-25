@@ -23,7 +23,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd November 8, 1999
+.Dd April 23, 2026
 .Dt PPPOED 8
 .Os
 .Sh NAME
@@ -37,6 +37,10 @@
 .Op Fl e Ar exec | Fl l Ar label
 .Op Fl n Ar ngdebug
 .Op Fl p Ar provider
+.Op Fl L
+.Op Fl w Ar workers
+.Op Fl A Ar algorithm
+.Op Fl G Ar max_workers
 .Ar interface
 .Sh DESCRIPTION
 The
@@ -159,6 +163,64 @@ If
 is given,
 .Nm
 will write its process ID to this file on startup.
+.Pp
+For high-throughput environments, multithreaded mode can be enabled to
+distribute PPPoE sessions across multiple worker nodes, allowing parallel
+processing on multi-core systems:
+.Bl -tag -width 3n
+.It Fl L
+Enable load balancer mode.
+When this flag is specified,
+.Nm
+creates a
+.Xr ng_pppoe_lb 4
+load balancer node and multiple
+.Xr ng_pppoe 4
+worker nodes instead of a single
+.Nm pppoe
+node.
+This enables multithreaded PPPoE processing.
+.It Fl w Ar workers
+Specify the number of worker nodes to create when using
+.Fl L .
+Default is 1 (single-threaded mode).
+For optimal performance, set this to the number of CPU cores available.
+.It Fl A Ar algorithm
+Select the load balancing algorithm when using
+.Fl L :
+.Bl -tag -width 3n
+.It Cm 0
+Round-robin distribution for discovery packets (default).
+.It Cm 1
+Hash-based distribution using Session ID.
+.It Cm 2
+Least-loaded worker selection (higher overhead).
+.El
+.It Fl G Ar max_workers
+Set the CPU governor maximum workers limit.
+When set to 0 (default), the governor auto-detects to the number of CPU cores.
+When set to a positive value, this becomes the hard cap for dynamic worker scaling.
+The value is always clamped to not exceed the number of CPU cores
+.Pq Va mp_ncpus .
+.El
+.Pp
+The CPU governor monitors system-wide CPU utilization and can dynamically
+scale workers up or down:
+.Bl -tag -width 3n
+.It Cm Scale-up
+Triggered when CPU utilization exceeds 80%.
+.It Cm Scale-down
+Triggered when CPU utilization drops below 30%.
+.El
+.Pp
+Example multithreaded configuration with 8 workers and hash algorithm:
+.Bd -literal -offset indent
+pppoed -L -w 8 -A 1 -G 8 em0
+.Ed
+.Pp
+Default behavior (without
+.Fl L )
+remains single-threaded and backward compatible with existing deployments.
 .Sh DIAGNOSTICS
 After creating the necessary
 .Xr netgraph 4
@@ -196,7 +258,9 @@ and the following to
 .Xr netgraph 4 ,
 .Xr ng_ether 4 ,
 .Xr ng_pppoe 4 ,
+.Xr ng_pppoe_lb 4 ,
 .Xr ng_socket 4 ,
+.Xr ngctl 8 ,
 .Xr syslog.conf 5 ,
 .Xr ppp 8 ,
 .Xr syslogd 8

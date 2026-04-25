@@ -1,0 +1,213 @@
+.\" Copyright (c) 2026 CloudBSD Organization
+.\" All rights reserved.
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd April 23, 2026
+.Dt NG_PPPOE_LB 4
+.Os
+.Sh NAME
+.Nm ng_pppoe_lb
+.Nd PPPoE load balancer netgraph node type for multithreaded PPPoE
+.Sh SYNOPSIS
+.In sys/types.h
+.In netgraph.h
+.In netgraph/ng_pppoe_lb.h
+.Sh DESCRIPTION
+The
+.Nm pppoe_lb
+node type provides session-aware load balancing for multiple PPPoE worker nodes,
+enabling multithreaded PPPoE processing on multi-core systems.
+It distributes PPPoE discovery packets across worker nodes and maintains
+session affinity for data packets by hashing the PPPoE Session ID.
+.Pp
+This node type is designed to work with multiple
+.Xr ng_pppoe 4
+worker nodes, allowing parallel processing of PPPoE sessions across multiple
+CPU cores while preserving per-session packet ordering.
+.Sh HOOKS
+This node type supports the following hooks:
+.Bl -tag -width ".Va downstream"
+.It Va upstream
+The hook connected to the Ethernet interface (typically from an
+.Xr ng_ether 4
+node).
+All incoming PPPoE packets from the network arrive on this hook.
+.It Va downstream
+Multiple downstream hooks, one for each worker node.
+Each downstream hook corresponds to a specific
+.Xr ng_pppoe 4
+worker node that will handle sessions assigned to it.
+.El
+.Sh CONTROL MESSAGES
+This node type supports the generic control messages, plus the following:
+.Bl -tag -width 3n
+.It Dv NGM_PPPOE_LB_GET_STATS
+Returns statistics in a
+.Dv "struct ng_pppoe_lb_stats" :
+.Bd -literal -offset 4n
+struct ng_pppoe_lb_stats {
+    uint64_t  total_packets;      /* Total packets processed */
+    uint64_t  discovery_packets;  /* PADI/PADO/PADR/PADS packets */
+    uint64_t  session_packets;    /* Session data packets */
+    uint64_t  session_collisions; /* Hash collisions detected */
+    uint32_t  active_workers;     /* Number of active worker nodes */
+    uint32_t  active_sessions;    /* Number of active sessions */
+    uint32_t  algorithm;          /* Current load balancing algorithm */
+    uint32_t  max_workers;        /* Governor maximum workers */
+};
+.Ed
+.It Dv NGM_PPPOE_LB_GET_SESSION_MAP
+Returns the session-to-worker mapping table in a
+.Dv "struct ng_pppoe_lb_session_map" :
+.Bd -literal -offset 4n
+struct ng_pppoe_lb_session_entry {
+    uint16_t  session_id;    /* PPPoE Session ID */
+    uint8_t   worker_id;     /* Assigned worker node index */
+    uint8_t   reserved;      /* Reserved for future use */
+};
+
+struct ng_pppoe_lb_session_map {
+    uint32_t  count;                      /* Number of entries */
+    struct ng_pppoe_lb_session_entry entries[]; /* Flexible array */
+};
+.Ed
+.It Dv NGM_PPPOE_LB_CONFIG
+Configure runtime parameters using a
+.Dv "struct ng_pppoe_lb_config" :
+.Bd -literal -offset 4n
+struct ng_pppoe_lb_config {
+    uint32_t  algorithm;     /* Load balancing algorithm (0=round-robin, 1=hash, 2=least-loaded) */
+    uint32_t  max_workers;   /* Governor maximum workers (0=auto/mp_ncpus) */
+    uint32_t  debug;         /* Enable debug logging (0=off, 1=on) */
+};
+.Ed
+.El
+.Sh LOAD BALANCING ALGORITHMS
+The load balancer supports three algorithms:
+.Bl -tag -width 3n
+.It Cm 0
+.Pq Cm round-robin
+Discovery packets are distributed evenly across all worker nodes.
+Session packets are routed based on Session ID hash.
+This is the default algorithm.
+.It Cm 1
+.Pq Cm hash
+Both discovery and session packets use consistent hashing.
+Provides better load distribution but may be less predictable.
+.It Cm 2
+.Pq Cm least-loaded
+Attempts to route to the worker with fewest active sessions.
+Requires session tracking overhead; not recommended for high-throughput scenarios.
+.El
+.Sh CPU GOVERNOR
+The load balancer includes a CPU governor that monitors system-wide CPU utilization
+and can dynamically scale the number of worker nodes up or down:
+.Bl -tag -width 3n
+.It Cm Scale-up
+When CPU utilization exceeds 80%, the governor logs a scale-up event.
+.It Cm Scale-down
+When CPU utilization drops below 30%, the governor logs a scale-down event.
+.It Cm Hard Cap
+The
+.Va max_workers
+parameter enforces a hard limit that never exceeds the number of CPU cores
+.Pq Va mp_ncpus .
+Setting
+.Va max_workers=0
+auto-detects to the number of CPU cores.
+.El
+.Pp
+The governor logs scale-up/scale-down intent; actual worker creation/removal
+is handled by userland tools
+.Pq Xr ngctl 8 , Xr pppoed 8 .
+.Sh SYSCTL VARIABLES
+The following
+.Xr sysctl 8
+variables are available under
+.Va net.graph.pppoe_lb :
+.Bl -tag -width ".Va debug"
+.It Va net.graph.pppoe_lb.total_packets
+Total number of packets processed by the load balancer.
+.It Va net.graph.pppoe_lb.discovery_packets
+Number of PPPoE discovery packets (PADI/PADO/PADR/PADS).
+.It Va net.graph.pppoe_lb.session_packets
+Number of PPPoE session data packets.
+.It Va net.graph.pppoe_lb.session_collisions
+Number of hash collisions detected in session-to-worker mapping.
+.It Va net.graph.pppoe_lb.active_workers
+Current number of active worker nodes.
+.It Va net.graph.pppoe_lb.active_sessions
+Current number of active PPPoE sessions.
+.It Va net.graph.pppoe_lb.algorithm
+Current load balancing algorithm (0=round-robin, 1=hash, 2=least-loaded).
+.It Va net.graph.pppoe_lb.max_workers
+Governor maximum workers (0=auto-detect to CPU cores, >0=explicit hard cap).
+.It Va net.graph.pppoe_lb.debug
+Enable debug logging (0=disabled, 1=enabled).
+.El
+.Sh EXAMPLES
+Load the kernel module:
+.Bd -literal -offset indent
+kldload ng_pppoe_lb
+.Ed
+.Pp
+Create a load balancer topology with 4 workers:
+.Bd -literal -offset indent
+ngctl name . pppoe_lb0
+ngctl mkpeer pppoe_lb0: pppoe worker0
+ngctl mkpeer pppoe_lb0: pppoe worker1
+ngctl mkpeer pppoe_lb0: pppoe worker2
+ngctl mkpeer pppoe_lb0: pppoe worker3
+ngctl connect em0: pppoe_lb0 upstream
+.Ed
+.Pp
+Configure load balancer with hash algorithm and 8-worker cap:
+.Bd -literal -offset indent
+sysctl net.graph.pppoe_lb.algorithm=1
+sysctl net.graph.pppoe_lb.max_workers=8
+.Ed
+.Pp
+Query statistics:
+.Bd -literal -offset indent
+ngctl pppoe_lb show pppoe_lb0:
+.Ed
+.Sh SEE ALSO
+.Xr ngctl 8 ,
+.Xr pppoed 8 ,
+.Xr ng_pppoe 4 ,
+.Xr ng_ether 4 ,
+.Xr netgraph 4 ,
+.Xr sysctl 8
+.Sh HISTORY
+The
+.Nm pppoe_lb
+node type first appeared in FreeBSD 16.0 as part of the multithreaded PPPoE
+implementation to support high-throughput broadband access concentrators.
+.Sh AUTHORS
+.An Mark LaPointe Aq Mt mark@cloudbsd.org
+.Sh BUGS
+The governor CPU monitoring currently uses system-wide CPU statistics.
+Per-worker CPU monitoring is not yet implemented.
+.Pp
+The least-loaded algorithm (algorithm=2) has higher overhead and is not
+recommended for production use with high session counts.

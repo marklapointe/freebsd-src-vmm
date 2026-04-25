@@ -23,6 +23,24 @@ pppoed_start()
 	if [ -n "${pppoed_provider}" ]; then
 			pppoed_flags="${pppoed_flags} -p ${pppoed_provider}"
 	fi
+
+	# Multithreaded PPPoE support
+	if [ "${pppoed_loadbalancer}" = "YES" ]; then
+		pppoed_flags="${pppoed_flags} -L"
+		
+		if [ -n "${pppoed_workers}" ]; then
+			pppoed_flags="${pppoed_flags} -w ${pppoed_workers}"
+		fi
+		
+		if [ -n "${pppoed_algorithm}" ]; then
+			pppoed_flags="${pppoed_flags} -A ${pppoed_algorithm}"
+		fi
+		
+		if [ -n "${pppoed_governor_max}" ]; then
+			pppoed_flags="${pppoed_flags} -G ${pppoed_governor_max}"
+		fi
+	fi
+
 	startmsg 'Starting pppoed'
 	_opts=$-; set -f
 	/usr/libexec/pppoed ${pppoed_flags} ${pppoed_interface}
